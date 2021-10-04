@@ -25,8 +25,8 @@ import (
 	"log"
 	"math/big"
 	"os"
-	"reflect"
 	"strconv"
+	"time"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/core/types"
@@ -40,7 +40,8 @@ import (
 	"github.com/offchainlabs/arbitrum/packages/arb-util/inbox"
 )
 
-const SequencerInboxAddressString = "0xDF634a2801b75A8a2d6FBA57BE478A2111db44d3"
+// CUSTOM SEQUENCER - don't need delayedMessagesRead > 1 (can be 0)
+const SequencerInboxAddressString = "0x140318708284EF8fF2387995bb5AB9f349bAD04E"
 
 type SequencerBatcher struct {
 	SequencerAddress common.Address
@@ -84,11 +85,11 @@ func NewSequencerBatcher(address string, ethClient *ethclient.Client) (*Sequence
 
 const maxTxDataSize int = 100_000
 
-func (b *SequencerBatcher) BatchTransactions(txs []*types.Transaction, prevAcc common.Hash, prevMsgCount *big.Int) (SequencerBatchItem, int) {
 
+func (b *SequencerBatcher) BatchTransactions(txs []*types.Transaction, prevAcc common.Hash, prevMsgCount big.Int, l1BlockNumber *big.Int, l1Timestamp *big.Int, useMultipleSeqMsgs bool) (SequencerBatchItem, int) {
 	var l2BatchContents []message.AbstractL2Message
 	var batchDataSize int
-	finalTransactionProcessed := 0
+	numTxsProcessed := 0
 
 	// make sure each tx is under limit
 	for index, tx := range txs {
@@ -97,13 +98,17 @@ func (b *SequencerBatcher) BatchTransactions(txs []*types.Transaction, prevAcc c
 			continue
 		}
 		if batchDataSize+len(tx.Data()) > maxTxDataSize {
-			finalTransactionProcessed = index - 1
-			fmt.Println("Transaction batch too large, ending batch at tx (inclusive) at position: " + strconv.Itoa(finalTransactionProcessed))
+			numTxsProcessed = index
+			fmt.Println("Transaction batch too large, ending batch after adding (inclusive) " + strconv.Itoa(numTxsProcessed) + " transactions")
 			break
 		}
-
+		numTxsProcessed = index + 1
 		l2BatchContents = append(l2BatchContents, message.NewCompressedECDSAFromEth(tx))
 		batchDataSize += len(tx.Data())
+
+		if useMultipleSeqMsgs {
+			break
+		}
 	}
 
 	batch, err := message.NewTransactionBatchFromMessages(l2BatchContents)
@@ -114,35 +119,26 @@ func (b *SequencerBatcher) BatchTransactions(txs []*types.Transaction, prevAcc c
 
 	l2Message := message.NewSafeL2Message(batch)
 
-	// TODO: pull chain time or take in chain time as parameter
 	chainTime := inbox.NewRandomChainTime()
-
-	msgCount := prevMsgCount.Add(prevMsgCount, big.NewInt(1))
+	chainTime.BlockNum = common.NewTimeBlocks(l1BlockNumber)
+	chainTime.Timestamp = l1Timestamp
 
 	// convert l2Message to seqMsg
-	seqMsg := message.NewInboxMessage(l2Message, b.SequencerAddress, new(big.Int).Set(msgCount), big.NewInt(0), chainTime)
+	seqMsg := message.NewInboxMessage(l2Message, b.SequencerAddress, &prevMsgCount, big.NewInt(0), chainTime)
 	txBatchItem := NewSequencerItem(big.NewInt(0), seqMsg, prevAcc)
 
-	return txBatchItem, finalTransactionProcessed
+	return txBatchItem, numTxsProcessed
 }
 
-func (b *SequencerBatcher) CreateMultipleBatches(txs []*types.Transaction) []SequencerBatchItem {
-	// get sequencer inbox length
-	seqInboxLength, err := b.contract.GetInboxAccsLength(nil)
+// random constants that work
+const blockNumber int64 = 9364214
+const timestamp int64 = 1231231231
+func (b *SequencerBatcher) CreateMultipleBatches(txs []*types.Transaction, useMultipleSeqMsgs bool, useMultipleSections bool) []SequencerBatchItem {
+	// get current sequencer inbox length
+	prevAcc, err := b.getPrevAcc()
 	if err != nil {
-		fmt.Println("Error retrieving sequencer inbox length from sequencer inbox contract")
+		fmt.Println("Error getting prev acc: " + err.Error())
 		return nil
-	}
-	fmt.Println("Sequencer Inbox Length: " + seqInboxLength.String())
-
-	// get prev acc
-	var prevAcc common.Hash = common.HexToHash("0x00")
-	if seqInboxLength.Cmp(big.NewInt(0)) > 0 {
-		prevAcc, err = b.contract.InboxAccs(nil, seqInboxLength.Sub(seqInboxLength, big.NewInt(1)))
-		if err != nil {
-			fmt.Println("Error retrieving last inbox acc from sequencer inbox contract")
-			return nil
-		}
 	}
 	fmt.Println("Previous acc: " + prevAcc.String())
 
@@ -154,25 +150,30 @@ func (b *SequencerBatcher) CreateMultipleBatches(txs []*types.Transaction) []Seq
 	}
 	fmt.Println("Previous message count: " + prevMsgCount.String())
 
+	l1BlockNumber := big.NewInt(blockNumber)
+	l1Timestamp := big.NewInt(timestamp)
+
 	var seqBatchItems []SequencerBatchItem
 	numTxs := len(txs)
-	lastTxProcessed := 0
-	for lastTxProcessed < numTxs {
-		seqBatchItem, txCount := b.BatchTransactions(txs[lastTxProcessed:], prevAcc, prevMsgCount)
-		if txCount == -1 {
-			fmt.Println("BatchTransactions returned negative tx processed count. " +
+	nextTxToProcessIndex := 0
+	for nextTxToProcessIndex < numTxs {
+		seqBatchItem, numTxsProcessed := b.BatchTransactions(txs[nextTxToProcessIndex:], prevAcc, *prevMsgCount, l1BlockNumber, l1Timestamp, useMultipleSeqMsgs)
+		if numTxsProcessed == 0 {
+			fmt.Println("BatchTransactions did not batch any txs. " +
 				"This can happen if first tx is larger than max batch size.")
 			break
 		}
 
-		lastTxProcessed++
+		nextTxToProcessIndex += numTxsProcessed
 		seqBatchItems = append(seqBatchItems, seqBatchItem)
 		prevAcc = seqBatchItem.Accumulator
-		prevMsgCount = seqBatchItem.LastSeqNum
-	}
+		prevMsgCount = prevMsgCount.Add(prevMsgCount, big.NewInt(1))
 
-	fmt.Println("Final acc: " + prevAcc.String())
-	fmt.Println("Final seq num (total batches): " + prevMsgCount.String())
+		if useMultipleSections {
+			l1BlockNumber = l1BlockNumber.Add(l1BlockNumber, big.NewInt(1))
+			l1Timestamp = l1Timestamp.Add(l1Timestamp, big.NewInt(1))
+		}
+	}
 
 	return seqBatchItems
 }
@@ -185,7 +186,7 @@ func (b *SequencerBatcher) PublishBatchToInbox(seqBatchItems []SequencerBatchIte
 	var transactionsData []byte
 	var transactionsLengths []*big.Int
 	var metadata []*big.Int
-	var startDelayedMessagesRead *big.Int
+	var startDelayedMessagesRead *big.Int = big.NewInt(0)
 	var l1BlockNumber *big.Int
 	var l1Timestamp *big.Int
 	var lastAcc common.Hash
@@ -193,7 +194,6 @@ func (b *SequencerBatcher) PublishBatchToInbox(seqBatchItems []SequencerBatchIte
 	estimatedGasCost := gasCostBase
 	lastMetadataEnd := 0
 
-	// TODO: figure out startDelayedMessagesRead
 	for _, batch := range seqBatchItems {
 		if len(batch.SequencerMessage) >= 128*1024 {
 			// batch too large
@@ -215,6 +215,9 @@ func (b *SequencerBatcher) PublishBatchToInbox(seqBatchItems []SequencerBatchIte
 			// [numItems, l1BlockNumber, l1Timestamp, newTotalDelayedMessagesRead, newDelayedAcc]
 			metadata = append(metadata, big.NewInt(int64(sectionCount)), l1BlockNumber, l1Timestamp, startDelayedMessagesRead, big.NewInt(0))
 			lastMetadataEnd = len(transactionsLengths)
+
+			l1BlockNumber = seqMsg.ChainTime.BlockNum.AsInt()
+			l1Timestamp = seqMsg.ChainTime.Timestamp
 		}
 
 		transactionsData = append(transactionsData, seqMsg.Data...)
@@ -224,53 +227,37 @@ func (b *SequencerBatcher) PublishBatchToInbox(seqBatchItems []SequencerBatchIte
 		lastSeqNum = batch.LastSeqNum
 	}
 
+	fmt.Println("Seq num/ message count after adding these batches: " + lastSeqNum.String())
+	fmt.Println("Estimated gas cost: " + strconv.Itoa(estimatedGasCost))
+
 	lastSectionCount := len(transactionsLengths) - lastMetadataEnd
 	if lastSectionCount > 0 {
 		metadata = append(metadata, big.NewInt(int64(lastSectionCount)), l1BlockNumber, l1Timestamp, startDelayedMessagesRead, big.NewInt(0))
 	}
 
-	fmt.Println("Last acc: " + lastAcc.String())
-	fmt.Println("Last seq num: " + lastSeqNum.String())
-	/*
-	fmt.Println("Number of batches included: " + strconv.Itoa(len(transactionsLengths)))
-	fmt.Println("Metadata length: " + strconv.Itoa(len(metadata)))
-	fmt.Println("Printing metadata...")
-	for i := 0; i < len(metadata); i += 5 {
-		fmt.Println("Section: " + strconv.Itoa(i + 1))
-
-		fmt.Println("Num items: " + metadata[i].String())
-		fmt.Println("L1 block number: " + metadata[i + 1].String())
-		fmt.Println("L1 timestamp: " + metadata[i + 2].String())
-		fmt.Println("NewTotalDelayedMessagesRead: " + metadata[i + 3].String())
-		fmt.Println("newDelayedAcc: " + metadata[i + 4].String())
-	} */
-
 	b.prepareAuthForTransaction()
-	var lastAccBytes [32]byte
-	lastAccBytes = lastAcc
-	testReflection(transactionsData, transactionsLengths, metadata, lastAccBytes)
-	/*
-	tx, err := b.contract.AddSequencerL2BatchFromOrigin(b.auth, transactionsData, transactionsLengths, metadata, lastAccBytes)
-
+	tx, err := b.contract.AddSequencerL2BatchFromOrigin(b.auth, transactionsData, transactionsLengths, metadata, lastAcc)
 	if err != nil {
-		fmt.Println("Error sending batches to sequencer inbox")
-		return false, err
-	}
-	fmt.Println("Transaction hash: " + tx.Hash().Hex()) */
-
-	return true, nil
-
-
-	/*
-	// Call transaction
-	arbTx, err := ethbridge.AddSequencerL2BatchFromOriginCustomNonce(ctx, b.sequencerInbox, b.auth, nonce, transactionsData, transactionsLengths, metadata, lastAcc, b.gasRefunderAddress, b.config.Node.Sequencer.GasRefunderExtraGas)
-	if err != nil {
+		fmt.Println("Error sending batches to sequencer inbox: " + err.Error())
 		return false, err
 	}
 
-	// Update prevMsgCount for the next iteration if we're not publishingAllBatchItems
-	// AddSequencerL2BatchFromOriginCustomNonce will have already updated the nonce
-	prevMsgCount.Set(newMsgCount)*/
+	txSuccess, err := b.logTransactionResults(tx)
+	if err != nil {
+		fmt.Println("Error logging transaction results")
+		return false, err
+	}
+
+	// compare accs
+	fmt.Println("\nChecking if accs match...")
+	fmt.Println("Locally calculated acc: " + lastAcc.String())
+	contractAcc, err := b.getPrevAcc()
+	if err != nil {
+		fmt.Println("Error calling getPrevAcc for the contract acc")
+	}
+	fmt.Println("Contract calculated acc: " + contractAcc.String())
+
+	return txSuccess, nil
 }
 
 func (b SequencerBatcher) prepareAuthForTransaction() {
@@ -292,8 +279,56 @@ func (b SequencerBatcher) prepareAuthForTransaction() {
 	b.auth.GasPrice = gasPrice
 }
 
-// use godot package to load/read the .env file and
-// return the value of the key
+func (b SequencerBatcher) getPrevAcc() (common.Hash, error) {
+	seqInboxLength, err := b.contract.GetInboxAccsLength(nil)
+	if err != nil {
+		fmt.Println("Error retrieving sequencer inbox length from sequencer inbox contract")
+		return *new([32]byte), err
+	}
+
+	// get prev acc
+	var prevAcc common.Hash = common.HexToHash("0x00")
+	if seqInboxLength.Cmp(big.NewInt(0)) > 0 {
+		prevAcc, err = b.contract.InboxAccs(nil, seqInboxLength.Sub(seqInboxLength, big.NewInt(1)))
+		if err != nil {
+			fmt.Println("Error retrieving last inbox acc from sequencer inbox contract")
+			return *new([32]byte), err
+		}
+	}
+	return prevAcc, nil
+}
+
+func (b SequencerBatcher) logTransactionResults(tx *types.Transaction) (bool, error){
+	receipt, err := b.EthClient.TransactionReceipt(context.Background(), tx.Hash())
+	if err != nil {
+		fmt.Println("Error getting transaction receipt")
+		fmt.Println("Error: " + err.Error())
+	}
+
+	counter := 0
+	const maxTries int = 5
+	for receipt == nil && counter < maxTries {
+		time.Sleep(10 * time.Second)
+		receipt, err = b.EthClient.TransactionReceipt(context.Background(), tx.Hash())
+		counter++
+		if err != nil {
+			fmt.Println("Error getting transaction receipt on attempt: " + strconv.Itoa(counter))
+			fmt.Println("Error: " + err.Error())
+
+			if counter == maxTries {
+				fmt.Println("Error getting transaction receipt. Max attempts reached.")
+				return false, err
+			}
+		}
+	}
+
+	fmt.Println("\nTransaction sent!")
+	fmt.Println("Transaction hash: " + tx.Hash().Hex())
+	fmt.Println("Transaction status: " + strconv.Itoa(int(receipt.Status)))
+	fmt.Println("Gas used: " + strconv.Itoa(int(receipt.GasUsed)))
+	return true, nil
+}
+
 func goDotEnvVariable(key string) string {
 
 	// load .env file
@@ -305,31 +340,3 @@ func goDotEnvVariable(key string) string {
 
 	return os.Getenv(key)
 }
-
-func testReflection(params ...interface{}) {
-
-	for _, a := range params {
-		value := reflect.ValueOf(a)
-		elemType := value.Elem().Type()
-		fmt.Println(elemType.String())
-	}
-}
-
-/*
-func (b *SequencerBatcher) handleBatchReceiptLog(rawLog *types.Log) {
-	if rawLog.Address == b.gasRefunderAddress && rawLog.Topics[0] == refundGasCostsDeniedEventID {
-		parsedLog, err := b.gasRefunder.ParseRefundGasCostsDenied(*rawLog)
-		if err != nil {
-			logger.Warn().Err(err).Msg("failed to parse RefundGasCostsDenied log")
-			return
-		}
-		var loggingLog *zerolog.Event
-		if parsedLog.Reason == 0 || parsedLog.Reason == 1 {
-			// CONTRACT_NOT_ALLOWED or REFUNDEE_NOT_ALLOWED
-			loggingLog = logger.Error()
-		} else {
-			loggingLog = logger.Warn()
-		}
-		loggingLog.Int("reason", int(parsedLog.Reason)).Str("txHash", rawLog.TxHash.String()).Msg("batch posting gas costs refund denied")
-	}
-} */
